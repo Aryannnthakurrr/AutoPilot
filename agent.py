@@ -419,8 +419,14 @@ def llm_decide(B, opts, default):
                     for n, (c, w) in opts.items()},
         "rules_recommend": default,
     }
+    client = LLMClient()
+    # PUBLISH sandbox: any file open outside agent.py kills the call. requests' trust_env reads
+    # ~/.netrc (and proxy/CA env files) before each request; the gateway is a local http relay.
+    session = getattr(client, "_session", None)
+    if session is not None:
+        session.trust_env = False
     run = run_tool_loop(
-        LLMClient(),
+        client,
         [{"role": "system", "content": PROMPT}, {"role": "user", "content": json.dumps(board, separators=(",", ":"))}],
         [lane_report, check_plan],
         deadline_s=deadline,
