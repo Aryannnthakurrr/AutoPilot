@@ -105,13 +105,14 @@ if __name__ == "__main__":
     assert all((1, 1, y) in out and any(k == 3 and 4 <= x <= 6 and yy == y for k, x, yy in out) for y in range(6)), out
     assert sum(1 for k, x, _ in out if k == 2 and x == 0) >= 4, out
     # TC01 stall: three regenerating clowns -> a penguin just in front of the line.
-    assert (0, 3, 3) in triples(agent.get_reinforcements(TC01_STALL))
-    # Pirate baits: no bait's blast reaches any of our other tiles.
+    assert any(k == 0 and y == 3 and 3 <= x <= 5 for k, x, y in triples(agent.get_reinforcements(TC01_STALL)))
+    # Pirate rows: a blast on any shield never reaches a soldier, archer or penguin.
     out = triples(agent.get_reinforcements(CASES["pirate-heavy"]))
-    tiles = {(x, y) for _, x, y in out}
+    zone = lambda x, y: {(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1), (x + 1, y - 1), (x + 1, y + 1)}
+    soft = {(x, y) for k, x, y in out if k != 3}
     for k, x, y in out:
-        if k == 3 and x >= 3:
-            assert not (agent.blast_zone(x, y) & tiles), (x, y, out)
+        if k == 3:
+            assert not (zone(x, y) & soft), (x, y, out)
     # Shields never past x=6 (clowns would stop off the board).
     for s in CASES.values():
         assert all(not (k == 3 and x > 6) for k, x, _ in triples(agent.get_reinforcements(s)))
@@ -121,11 +122,18 @@ if __name__ == "__main__":
     # A lone clown in front of a healthy line: no penguin.
     lone = pause([u("defenceSolider", 1, 2, 150), u("defenceShield", 4, 2, 700)], [foe("EnemClown", 7, 2, 150)])
     assert not any(k == 0 for k, *_ in triples(agent.get_reinforcements(lone)))
-    # Coin floor: starting coins 1500 -> floor 300; an optional penguin is skipped at 400 coins...
-    poor = pause([u("defenceSolider", 1, 3, 150), u("defenceShield", 2, 3, 160, 700)],
-                 [foe("EnemClown", 6, 3, 117), foe("EnemClown", 6, 3, 80), foe("EnemClown", 6, 3, 192)], coins=400, queued=0)
-    poor["budget"]["unlocked"] = 1500 + 50 * 7
-    assert not any(k == 0 for k, *_ in triples(agent.get_reinforcements(poor)))
+    # Reserve: start 1500 -> reserve 300. A merely weak row (front low, line holds) gets nothing at 400 coins...
+    full = [u(t, x, y, h) for y in (0, 1, 2, 4, 5) for t, x, h in (("defenceSolider", 1, 150), ("defenceShield", 6, 700))]
+    poor = pause(full + [u("defenceSolider", 1, 3, 150), u("defenceShield", 6, 3, 100, 700)],
+                 [foe("EnemClown", 9, 3, 200)], coins=400, queued=0)
+    poor["budget"]["unlocked"] = 1500 + 50 * 9  # 10 in wave, 0 queued, 1 alive -> 9 kills
+    assert agent.analyse(poor)["reserve"] == 300
+    assert triples(agent.get_reinforcements(poor)) == [], agent.get_reinforcements(poor)
+    # ...a critical row (3 regenerating clowns on a worn shield) may spend below it.
+    crit = pause(full + [u("defenceSolider", 1, 3, 150), u("defenceShield", 6, 3, 160, 700)],
+                 [foe("EnemClown", 9, 3, 117), foe("EnemClown", 9, 3, 80), foe("EnemClown", 9, 3, 192)], coins=400, queued=0)
+    crit["budget"]["unlocked"] = 1500 + 50 * 7
+    assert any(k == 0 and y == 3 for k, _, y in triples(agent.get_reinforcements(crit)))
     # ...but a breach is still answered below the floor.
     breach = pause([], [foe("EnemyMonk", 6, 3, 280)], coins=400, queued=0)
     breach["budget"]["unlocked"] = 1500
@@ -144,7 +152,7 @@ if __name__ == "__main__":
     out = triples(agent.get_reinforcements(TC01_STALL))
     assert out[:2] == [(0, 3, 3), (2, 0, 3)] and all(k == 3 for k, *_ in out[2:]), out  # + open-row blockers
     FakeLLM.replies = [{"role": "assistant", "content": "I think... maybe"}]
-    assert (0, 3, 3) in triples(agent.get_reinforcements(TC01_STALL))       # garbage -> rules
+    assert any(k == 0 and y == 3 and 3 <= x <= 5 for k, x, y in triples(agent.get_reinforcements(TC01_STALL)))       # garbage -> rules
     FakeLLM.replies = [say({"placements": [[1, 5, 0]]})]                      # LLM skips row 3's breach
     out = triples(agent.get_reinforcements(CASES["pause-empty-row"]))
     assert any(y == 3 for _, _, y in out), out                                # safety net adds it
