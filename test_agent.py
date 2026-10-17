@@ -100,21 +100,20 @@ if __name__ == "__main__":
         assert dt < 0.5, dt
         print(f"ok  {name:17} {dt*1000:5.1f} ms  {triples(out)}")
 
-    # TC01 opening: no shields; archers@0 in the bottom rows, soldiers@1 in the top rows, every row covered.
+    # TC01 opening (5000 coins): archers only, one @0 in every row, extras above the reserve.
     out = triples(agent.get_reinforcements(TC01))
-    assert not any(k in (0, 3) for k, *_ in out), out
-    assert sorted(y for k, _, y in out if k == 1) == [3, 4, 5], out
-    assert {y for k, x, y in out if k == 2 and x == 0} >= {0, 1, 2}, out
+    assert {k for k, *_ in out} == {2}, out
+    assert {y for k, x, y in out if x == 0} == set(range(6)), out
     # Never two soldiers in one row, anywhere.
     for s in CASES.values():
         rows = [y for k, _, y in triples(agent.get_reinforcements(s)) if k == 1]
         assert len(rows) == len(set(rows)), rows
-    # Pause: a dps gap in a TOP row gets a soldier, in a BOTTOM row archers; empty rows get their unit.
+    # Pause: a dps gap gets archers (never soldiers); empty rows get their unit.
     gap = pause([u("defenceShield", 6, 0, 100, 700), u("defenceShield", 6, 4, 100, 700)],
                 [foe("EnemyMonk", 7, 0, 280), foe("EnemyMonk", 7, 4, 280)], coins=2500, queued=14)
     gap["counts"]["totalEnemiesInWave"] = 18
     out = triples(agent.get_reinforcements(gap))
-    assert (1, 1, 4) in out and not any(k == 1 and y == 0 for k, _, y in out), out
+    assert not any(k == 1 for k, *_ in out), out
     assert sum(1 for k, *_ in out if k == 2) >= 2, out
     assert all(any(yy == y for _, _, yy in out) or y in (0, 4) for y in range(6)), out
     # TC01 stall: three regenerating clowns -> a penguin just in front of the line.
@@ -222,11 +221,53 @@ if __name__ == "__main__":
     out = triples(agent.get_reinforcements(tc04))
     assert not any(k == 0 for k, *_ in out) and sum(1 for k, *_ in out if k == 2) >= 3, out
 
+    # Shield x follows the enemy: a monk already at x=4 in an empty top row -> shield in front of it, not at 6.
+    deep = pause([u("defenceArcher", 0, y, 100) for y in range(3)] + [u("defenceShield", 6, y, 700) for y in (3, 5)],
+                 [foe("EnemyMonk", 4, 4, 280)], coins=2000, queued=5)
+    out = triples(agent.get_reinforcements(deep))
+    assert any(k == 3 and y == 4 and x < 4 for k, x, y in out) and not any(y == 4 and x >= 4 for _, x, y in out), out
+    # ...and an LLM card behind the enemy is moved in front of it.
+    agent.USE_LLM, agent.LLMClient = True, FakeLLM
+    FakeLLM.replies = [say({"placements": [[3, 6, 4]], "reason": "x"})]
+    out = triples(agent.get_reinforcements(deep))
+    assert any(k == 3 and y == 4 and x < 4 for k, x, y in out) and not any(y == 4 and x >= 4 for _, x, y in out), out
+    agent.USE_LLM = False
+    # Public TC03 (2000 coins): 6 archers don't fit above half the reserve -> 5 archers + a shield in the
+    # densest row (row 5: 2 wizards + 2 pirates expected). No soldiers.
+    tc03 = opening([{"enemyId": 0, "count": 2, "allowedRows": [2, 3]}, {"enemyId": 1, "count": 2, "allowedRows": [0, 1]},
+                    {"enemyId": 2, "count": 4, "allowedRows": [0, 5]}, {"enemyId": 3, "count": 4, "allowedRows": [4, 5]}], coins=2000)
+    out = triples(agent.get_reinforcements(tc03))
+    spent = sum({0: 250, 1: 200, 2: 300, 3: 150}[k] for k, *_ in out)
+    assert 2000 - spent >= agent.analyse(tc03)["reserve"], (spent, out)          # the reserve holds
+    assert (3, 6, 5) in out and sum(1 for k, *_ in out if k == 2) >= 3, out       # densest row shielded first
+    # Density: 3 clowns bunched in a row that is holding -> a penguin right in front of the bunch.
+    bunch = pause([u("defenceArcher", 0, y, 100) for y in range(6)] + [u("defenceShield", 6, 4, 700)],
+                  [foe("EnemClown", 9, 4, 200), foe("EnemClown", 9, 4, 200), foe("EnemClown", 10, 4, 200)], coins=2000, queued=6)
+    out = triples(agent.get_reinforcements(bunch))
+    assert (0, 8, 4) in out, out
+    # ...but two spread-out clowns in a holding row: no penguin.
+    spread = pause([u("defenceArcher", 0, y, 100) for y in range(6)] + [u("defenceShield", 6, 4, 700)],
+                   [foe("EnemClown", 7, 4, 200), foe("EnemClown", 10, 4, 200)], coins=2000, queued=6)
+    assert not any(k == 0 for k, *_ in triples(agent.get_reinforcements(spread)))
+
+    # Reserve leaks closed: an LLM opening that spends everything is trimmed back to the reserve...
+    agent.USE_LLM, agent.LLMClient = True, FakeLLM
+    FakeLLM.replies = [say({"placements": [[2, x, y] for y in range(6) for x in (0, 1)], "reason": "all in"})]
+    out = triples(agent.get_reinforcements(tc03))
+    assert sum(1 for k, *_ in out if k == 2) <= (2000 - agent.analyse(tc03)["reserve"]) // 300, out  # archers within the reserve
+    assert {y for *_, y in out} == set(range(6)), out                                               # rows left empty get shields
+    agent.USE_LLM = False
+    # ...and an exposed archer with an enemy coming but the row holding: no shield below the reserve.
+    hold = pause([u("defenceArcher", 0, y, 100) for y in range(6)], [foe("EnemClown", 9, 2, 200)], coins=700, queued=6)
+    hold["counts"]["totalEnemiesInWave"] = 12
+    hold["budget"]["unlocked"] = 2100 + 50 * 6   # start 2100 -> reserve 600
+    assert triples(agent.get_reinforcements(hold)) == [], agent.get_reinforcements(hold)
+
     # --- LLM path, with a fake client ---------------------------------------
     agent.USE_LLM, agent.LLMClient = True, FakeLLM
     FakeLLM.replies = [say({"option": "lean", "reason": "test"})]
     out = triples(agent.get_reinforcements(TC01))
-    assert sorted(k for k, *_ in out) == [1, 1, 1, 2, 2, 2], out  # lean: soldiers top, archers bottom
+    assert sorted(k for k, *_ in out) == [2] * 6, out  # lean: an archer in every row
     tool_call = {"role": "assistant", "content": None, "tool_calls": [
         {"id": "1", "type": "function", "function": {"name": "lane_report", "arguments": '{"row": 3}'}}]}
     FakeLLM.replies = [tool_call, say({"placements": [[0, 3, 3], [2, 0, 3]], "reason": "custom"})]

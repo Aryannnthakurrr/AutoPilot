@@ -71,11 +71,11 @@ T = {
     "wave_hp_per_archer": 1300,  # opening: one archer per this much wave HP (2..6 of them)
     "weak_margin": 1.0,       # row is weak if time-to-clear > front time * this
     "late_frac": 0.15,        # <= this share of the wave still queued = end of wave: critical fixes only
-    "min_archers_open": 3,    # always pre-place at least this many archers at the opening...
-    "archer_floor_frac": 0.5, # ...even below the reserve, but never below this share of it
+    "min_archers_open": 3,    # pre-place at least this many archers at the opening when the reserve allows
     "heavy_walkers": 3,       # a row this busy (or with heavy_hp enemy hp) gets a second shield layer
     "heavy_hp": 700,
-    "top_row": 3,             # rows >= this are "top": soldiers there (archers reach them last), archers below
+    "top_row": 3,
+    "penguin_bunch_hp": 350,  # a bunch must hold at least this much hp to be worth a 250 penguin             # rows >= this are "top": soldiers there (archers reach them last), archers below
     "llm_deadline": 11.0,     # s, hard cap (guide: 15 s per call; keep ~3 s spare)
     "llm_rounds_start": 3,
     "llm_rounds_pause": 3,    # 60 calls/min per team; pauses come every ~4 s real time
@@ -235,10 +235,18 @@ def assess(B, extra=()):
             first = y == min(f["y"] for f in B["foes"])  # archers are on this row right now
             # A penguin (250, single use) only for the rare SERIOUS case: 2+ wizards/clowns bunched within
             # 2 tiles in a row that is losing (breached/critical). One slide then kills them all.
-            regen_x = sorted(f["x"] for f in walkers if f["k"] in (CLOWN, WIZARD))
-            bunched = max((sum(1 for b in regen_x if 0 <= b - a <= 2) for a in regen_x), default=0)
-            serious = status in ("BREACH", "critical") and bunched >= 2
-            r.update(dps_here=sold + (archer_dps if first else 0), serious=serious,
+            # Penguin = density weapon: one slide hits every enemy in the row for 500. Worth it for a bunch
+            # (enemies within 2 tiles of each other, >= penguin_bunch_hp total): 3+ anywhere, or 2+ in a row
+            # that is losing ground (weak/critical/breach). Never for a lone enemy.
+            wx = sorted((f["x"], f["hp"]) for f in walkers)
+            bunch, bunch_hp = 0, 0.0
+            for a, _ in wx:
+                grp = [h for b, h in wx if 0 <= b - a <= 2]
+                if (len(grp), sum(grp)) > (bunch, bunch_hp):
+                    bunch, bunch_hp = len(grp), sum(grp)
+            serious = bunch_hp >= T["penguin_bunch_hp"] and (
+                bunch >= 3 or (bunch >= 2 and status in ("BREACH", "critical", "weak")))
+            r.update(dps_here=sold + (archer_dps if first else 0), serious=serious, bunch=bunch,
                      t_clear=_r(t_clear), t_front=_r(t_front), t_line=_r(t_line), t_reach=_r(t_reach), status=status,
                      nearest_enemy_x=foes[0]["x"])
         else:
@@ -276,23 +284,23 @@ def row_fixes(B, y, r, occ):
         return False
 
     def dps_gap(lst, level, need):
-        """Cover a dps shortfall: top row without a soldier -> one soldier first; the rest as archers."""
-        if need > 0 and y >= T["top_row"] and SOLDIER not in kinds:
-            if add(lst, SOLDIER, _pick((sx, 2, 0), y, occ, nearest), f"soldier (top row, need {need:.0f} dps)"):
-                need -= DPS[SOLDIER]
+        """Cover a dps shortfall with archers (they hit every row; soldiers only their own row)."""
         if need > 0:
             n = min(3, math.ceil(need / DPS[ARCHER]))
             arch[level] += n
             why.append(f"r{y} +{n} archer (need {need:.0f} dps)")
 
     status = r["status"]
+    if status == "ok" and r.get("serious") and PENGUIN not in kinds:  # a dense bunch: cash it in now
+        add(norm, PENGUIN, _pick(range(nearest - 1, front_x, -1), y, occ, nearest), f"penguin vs bunch of {r.get('bunch')}")
+        return crit, norm, why, 0, 0
     if status in ("open", "quiet", "ok"):
         return crit, norm, why, 0, 0
     t_line = r["t_line"] if r.get("t_line") is not None else INF
     need = (r["enemy_hp"] / max(min(t_line, r.get("t_reach") or INF), 1.0)) + r["regen"] - r.get("dps_here", 0)
     if status == "BREACH":
         if r.get("serious"):  # bunched wizards/clowns: one slide kills them all
-            add(crit, PENGUIN, _pick((min(nearest - 1, shx), 3, 2, 1, 0), y, occ, nearest), "BREACH->penguin")
+            add(crit, PENGUIN, _pick(range(nearest - 1, -1, -1), y, occ, nearest), "BREACH->penguin")
         else:  # tank: a shield stops them where archers can grind them down
             add(crit, SHIELD, _pick(range(min(nearest - 1, shx), -1, -1), y, occ, nearest), "BREACH->shield")
             dps_gap(crit, 0, need)
@@ -304,7 +312,7 @@ def row_fixes(B, y, r, occ):
     penguin = False
     if PENGUIN not in kinds and r.get("serious"):
         # In front of the line (closer than the nearest enemy) so the first throw/beam hits it now.
-        penguin = add(lst, PENGUIN, _pick([*range(front_x + 1, nearest), *range(front_x - 1, sx, -1)], y, occ, nearest),
+        penguin = add(lst, PENGUIN, _pick([*range(nearest - 1, front_x, -1), *range(front_x - 1, sx, -1)], y, occ, nearest),
                       f"penguin vs bunched {len(walkers)} ({status})")
     if not penguin:
         dps_gap(lst, 0 if status == "critical" else 1, need)
@@ -325,31 +333,41 @@ def archer_slots(B, occ, threats=None):
     out = [(0, y) for y in quiet + [y for y in ROWS if y not in quiet] if (0, y) not in occ]
     out += [(2, y) for y in ROWS if y not in quiet and (2, y) not in occ
             and any((x, y) in occ for x in range(3, MAX_X + 1))]
+    out += [(1, y) for y in ROWS if y not in quiet and (1, y) not in occ]  # stacked behind/among archers@0
     return out
 
 
 def row_unit(y):
-    """The unit that occupies an otherwise empty row: archers bottom, soldiers top."""
-    return (SOLDIER, T["soldier_x"]) if y >= T["top_row"] else (ARCHER, 0)
+    """What occupies an otherwise empty row: archers in the bottom rows (archers fire at the lowest row
+    first, so they guard their own), shields in the top rows (archers reach those last; a 700hp shield
+    holds there and survives 3 pirate blasts, where a soldier dies to one)."""
+    return (SHIELD, None) if y >= T["top_row"] else (ARCHER, 0)
+
+
+def shield_x(B, y, tiles):
+    """x=6 by default; if an enemy in this row is already at/inside 6, the furthest free tile in front of it."""
+    nearest = min((f["x"] for f in B["foes"] if f["y"] == y), default=MAX_X + 1)
+    return _pick(range(min(T["shield_x"], nearest - 1), 0, -1), y, tiles, nearest)
 
 
 def fill_empty(B, cards, rows, floor, units=True):
     """No row left empty (a pirate crosses faster than one decision): each row of `rows` with nothing in
-    it gets its unit (archer bottom / soldier top) while coins stay above `floor`, else a 150 shield."""
+    it gets its unit (archer bottom rows while coins stay above `floor`; a shield on top, or when short)."""
     tiles, left, out = _tiles(B, cards), B["coins"] - cost_of(cards, B["costs"]), []
-    empty = [y for y in rows if not any(t[1] == y for t in tiles)]
+    # top rows first: when coins run short, the rows archers reach last get covered first
+    empty = sorted((y for y in rows if not any(t[1] == y for t in tiles)), key=lambda y: -y)
     shield_p = B["costs"].get(SHIELD, 150)
     for i, y in enumerate(empty):
         kind, x = row_unit(y)
         p = B["costs"].get(kind, 999)
         later = shield_p * (len(empty) - i - 1)  # covering every row beats a better unit in one row
-        if units and left - p - later >= floor and (x, y) not in tiles:
+        if kind != SHIELD and units and left - p - later >= floor and (x, y) not in tiles:
             c = card(kind, x, y)
         else:
-            sx = _pick((T["shield_x"], T["shield_x"] - 1, T["shield_x"] - 2), y, tiles)
-            if sx is None:
+            sx = shield_x(B, y, tiles)
+            if sx is None or left < shield_p:
                 continue
-            c, p = card(SHIELD, sx, y), B["costs"].get(SHIELD, 150)
+            c, p = card(SHIELD, sx, y), shield_p
         out.append(c); tiles.add(tuple(_kxy(c)[1:])); left -= p
     return out
 
@@ -379,14 +397,23 @@ def keep_reserve(cards, coins, floor, costs):
 
 # --- options: opening -------------------------------------------------------
 def opening_options(B):
-    """No shields. Each threatened row gets one unit: archer@0 in bottom rows (0-2), soldier@1 in top rows
-    (3-5); at least 3 archers; spare coins above the reserve -> more archers (dps). A row the coins can't
-    cover with its unit gets a 150 shield, so no row is ever open."""
+    """Archers only (dps first): an archer@0 in every threatened row. If the coins can't do that, the
+    densest (then top) rows get a 150 shield instead, so no row is open. Spare coins above the reserve
+    -> more archers. Shields for tanking come at the pauses, once enemies are seen."""
     threats, costs, coins, res = B["threats"], B["costs"], B["coins"], B["reserve"]
     if not B["reinf"]:
         return opening_no_pauses(B)
     rows = sorted(threats)
-    cover = fill_empty(B, [], rows, T["archer_floor_frac"] * res)
+    pa, ps = costs.get(ARCHER, 300), costs.get(SHIELD, 150)
+    budget = coins - res  # archers keep the full reserve; only cover shields may go below it
+    # as many archers as possible while every threatened row still gets at least a shield
+    k = max([k for k in range(len(rows) + 1) if k * pa + (len(rows) - k) * ps <= budget], default=0)
+    dens = {y: sum(threats[y].values()) for y in rows}
+    shield_rows = set(sorted(rows, key=lambda y: (-dens[y], -y))[: len(rows) - k])  # densest, then top
+    cover = [card(ARCHER, 0, y) for y in rows if y not in shield_rows]
+    for y in sorted(shield_rows, key=lambda y: (-dens[y], -y)):
+        if cost_of(cover, costs) + ps <= coins:
+            cover.append(card(SHIELD, T["shield_x"], y))
     occ = _tiles(B, cover)
     have = sum(1 for c in cover if c["defenceId"] == ARCHER)
     # minimum archers: behind the top-row soldiers (x=0), bottom rows first
@@ -401,7 +428,7 @@ def opening_options(B):
         for c in slots:
             if n >= n_total:
                 break
-            lim = floor if n >= T["min_archers_open"] else T["archer_floor_frac"] * res
+            lim = floor  # the reserve holds at the opening: nothing is projected to cross yet
             if left - costs.get(ARCHER, 300) >= lim:
                 out.append(c); left -= costs.get(ARCHER, 300); n += 1
         return out
@@ -413,7 +440,9 @@ def opening_options(B):
         "balanced": (build(n_base, res), f"one unit per row + {n_base} archers total, keeps the reserve"),
         "lean": (lean, f"one unit per row + the minimum {T['min_archers_open']} archers"),
     }
-    return opts, "fortress", cover, {"wave_hp": wave_hp, "archers_suggested": n_base,
+    # safety net for rows a decision leaves empty: the cheapest blocker only (archers there would break the reserve)
+    blockers = [card(SHIELD, T["shield_x"], y) for y in rows]
+    return opts, "fortress", blockers, {"wave_hp": wave_hp, "archers_suggested": n_base,
                                      "threats": {y: {FOE_NAME.get(k, k): round(v, 1) for k, v in t.items()}
                                                  for y, t in threats.items()}}
 
@@ -460,8 +489,7 @@ def fortify(B, planned, late):
         nearest = min(foes)
         x = _pick(range(min(T["shield_x"], nearest - 1), max(units) + 1, -1), y, tiles, nearest)
         if x is not None:
-            has_archer = any(d["k"] == ARCHER for d in B["defs"] if d["y"] == y)
-            rows.append(((not has_archer, y), card(SHIELD, x, y)))
+            rows.append((-y, card(SHIELD, x, y)))  # top rows first: archers reach them last
     return [c for _, c in sorted(rows, key=lambda r: r[0])]
 
 
@@ -514,9 +542,10 @@ def pause_options(B):
         cards = list(cards)
         while True:
             out = cards + fill_empty(B, cards, ROWS, res, units)
-            if cost_of(out, costs) <= B["coins"] or len(cards) <= n_fixed:
+            covered = {t[1] for t in _tiles(B, out)}
+            if (cost_of(out, costs) <= B["coins"] and covered >= set(ROWS)) or len(cards) <= n_fixed:
                 return out
-            cards.pop()
+            cards.pop()  # an optional card gives way: no row may stay empty
 
     n_crit = len(critical)
     hold = finish(critical, n_crit, units=False)
@@ -533,15 +562,17 @@ def pause_options(B):
 # --- LLM decision -----------------------------------------------------------
 PROMPT = """You command a lane-defence game. Grid x 0-10 (base x=0; enemies enter at x=10 and walk left), rows y 0-5, 1 tile = 1.5 units. Enemies never change rows. ONE enemy crossing x=0 = LOSS.
 DEFENCES (id name cost hp):
-0 penguin 250 200hp: idle until hit, then slides forward through its row dealing 500 to EVERY enemy it touches, then gone. RARE: only for 2+ wizards/clowns bunched within 2 tiles in a losing row (status BREACH/critical; field "serious"). Never on a lone enemy, never at the opening. Penguins in other rows are dropped.
+0 penguin 250 200hp: idle until hit, then slides forward through its row dealing 500 to EVERY enemy it touches, then gone. A density weapon: for bunched enemies (field "serious"). Never on a lone enemy, never at the opening. Penguins in other rows are dropped.
 1 soldier 200 150hp: 40 dps at the first enemy anywhere ahead in its own row (unlimited range). One row only.
 2 archer 300 100hp: 26 dps into ANY row; all archers focus the LOWEST row with enemies (row 0 first), nearest to base. Our main source of dps.
 3 shield 150 700hp: no attack; enemies stop at the first defence in their row and their shots/beams hit it first. For tanking only.
 ENEMIES: clown 200hp +15/s regen, stops 3.3 tiles before the first defence, throws 17 dps. monk 280hp, 2.3 tiles/s, melee 36 dps. wizard 500hp +15/s regen, stops 5.3 tiles before the first defence, beam 50 dps (switches to the next defence in range). pirate 30hp, 5.3 tiles/s (crosses in 1.9 s, faster than one decision), explodes for 200 on the first defence it reaches (or where it dies), radius 1.3 tiles: same tile, x+-1, and the tiles above/below.
-STRATEGY: high dps from archers, few soldiers, shields only to tank, penguins rarely.
-- No row may be EMPTY between decisions (a fast enemy would cross): an empty row gets its unit, archer@0 in bottom rows 0-2, soldier@1 in top rows 3-5, else a shield@6 if coins are short. No shields at the opening.
-- More dps -> archers. A soldier only for a TOP row (3-5) that is short on dps (archers reach top rows last). Never two soldiers in one row.
-- Tank with a shield (x<=6, closer than the nearest enemy) only when needed: breach, a front about to fall, a pirate about to reach our units, a row with 3+ enemies, exposed units with enemies coming in their row (these exposed-unit shields are added AUTOMATICALLY after your answer).
+STRATEGY, in priority order: (1) maximise dps with archers; (2) shields so no row is ever empty; (3) penguins for density; (4) shields to tank for time while the archers at the back work. Soldiers only hit their own row: avoid them.
+- Opening: archers only, one @0 in every threatened row; only if coins can't cover that, shields in the densest/top rows. No other shields at the opening.
+- No row may be EMPTY between decisions (a fast enemy would cross): an empty row gets archer@0 in bottom rows 0-2, a shield in top rows 3-5.
+- Shield position: x=6 by default; if an enemy in that row is already at/inside x=6, the furthest free tile in front of it. Cards at or behind an enemy are moved in front of it automatically.
+- Penguin: when enemies bunch (3+ within 2 tiles, or 2+ in a row losing ground; field "serious", "bunch"): place it just in front of the bunch.
+- Tank with a shield only when needed: breach, a front about to fall, a pirate about to reach our units, a row with 3+ enemies, exposed units with enemies coming in their row (these are added AUTOMATICALLY after your answer).
 - Never put a shield past x=6 (clowns would stop off the board).
 SCORE of a WON game /100: win 25, kills 25, defences still standing 25, speed 10, coins left 15. A LOST game scores only kills. Priorities: 1) never lose, 2) keep defences alive, 3) speed, 4) coins left.
 PENGUINS go IN FRONT of the front defence (closer than the nearest enemy) so they fire now.
@@ -655,6 +686,24 @@ def enforce_reserve(B, cards, critical_rows):
     return out
 
 
+def in_front(B, cards):
+    """A card at/behind the nearest enemy of its row is useless (enemies walk past it, soldiers ignore
+    what is behind them): shields/penguins move to the furthest free tile in front of that enemy,
+    archers/soldiers to the free tile nearest the base."""
+    tiles, out = set(B["occ"]), []
+    for c in cards:
+        k, x, y = _kxy(c)
+        nearest = min((f["x"] for f in B["foes"] if f["y"] == y), default=MAX_X + 1)
+        if x >= nearest:
+            xs = range(nearest - 1, 0, -1) if k in (SHIELD, PENGUIN) else range(0, nearest)
+            nx = _pick(xs, y, tiles, nearest)
+            if nx is None:
+                continue
+            c, x = card(k, nx, y), nx
+        tiles.add((x, y)); out.append(c)
+    return out
+
+
 # --- entry point ------------------------------------------------------------
 def get_reinforcements(state):
     try:
@@ -665,12 +714,13 @@ def get_reinforcements(state):
             except Exception:
                 pass
             opts, default, critical, briefing = opening_options(B)
-            critical_rows = set(ROWS)
+            critical_rows = set()  # opening: nothing is projected to cross, the reserve holds
             B["penguin_rows"] = {y for y, t in B["threats"].items() if WIZARD in t}
         else:
             opts, default, critical, A = pause_options(B)
             briefing = A
-            critical_rows = {y for y, r in A["rows"].items() if r["status"] in ("BREACH", "critical", "open")}
+            # only rows the model projects to fall may spend below the reserve
+            critical_rows = {y for y, r in A["rows"].items() if r["status"] in ("BREACH", "critical")}
             B["penguin_rows"] = {y for y, r in A["rows"].items() if r.get("serious")}
             log("rows " + " | ".join(
                 f"r{y} {r['status']} hp={r['enemy_hp']} dps={r.get('dps_here', 0)} clear={r.get('t_clear')}s "
@@ -704,11 +754,11 @@ def get_reinforcements(state):
             late = B["queued"] <= T["late_frac"] * B["total"]
             # a 150 shield guarding a 300 archer is worth dipping to half the reserve
             add = keep_reserve(fortify(B, chosen, late), B["coins"] - cost_of(chosen, B["costs"]),
-                               T["archer_floor_frac"] * B["reserve"], B["costs"])
+                               B["reserve"], B["costs"])
             if add:
                 chosen = chosen + add
                 src += f" +fortify {[_kxy(c)[1:] for c in add]}"
-        out = check(chosen, set(B["occ"]), B["coins"], B["costs"])
+        out = check(in_front(B, chosen), set(B["occ"]), B["coins"], B["costs"])
         log(f"{src} -> placing {[_kxy(c) for c in out]}")
         return out
     except Exception as exc:
