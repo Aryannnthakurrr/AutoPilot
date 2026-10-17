@@ -115,7 +115,7 @@ if __name__ == "__main__":
     out = triples(agent.get_reinforcements(gap))
     assert not any(k == 1 for k, *_ in out), out
     assert sum(1 for k, *_ in out if k == 2) >= 2, out
-    assert all(any(yy == y for _, _, yy in out) or y in (0, 4) for y in range(6)), out
+    # (empty enemy-free rows are only filled with reserve + fill_extra coins: not asserted here)
     # TC01 stall: three regenerating clowns -> a penguin just in front of the line.
     assert any(k == 0 and y == 3 and 3 <= x <= 5 for k, x, y in triples(agent.get_reinforcements(TC01_STALL)))
     # Pirate rows: a blast on any shield never reaches a soldier, archer or penguin.
@@ -128,8 +128,8 @@ if __name__ == "__main__":
     # Shields never past x=6 (clowns would stop off the board).
     for s in CASES.values():
         assert all(not (k == 3 and x > 6) for k, x, _ in triples(agent.get_reinforcements(s)))
-    # Every row ends a pause obstructed: empty rows get their unit (or a shield when coins are short).
-    out = triples(agent.get_reinforcements(pause([u("defenceSolider", 1, 0, 150), u("defenceShield", 4, 0, 700)], [], queued=5)))
+    # With comfortable coins every empty row ends a pause obstructed (its unit, or a shield).
+    out = triples(agent.get_reinforcements(pause([u("defenceSolider", 1, 0, 150), u("defenceShield", 4, 0, 700)], [], coins=3000, queued=5)))
     assert all(any(yy == y for _, _, yy in out) for y in range(1, 6)), out
     # A lone clown in front of a healthy line: no penguin.
     lone = pause([u("defenceSolider", 1, 2, 150), u("defenceShield", 4, 2, 700)], [foe("EnemClown", 7, 2, 150)])
@@ -155,12 +155,12 @@ if __name__ == "__main__":
 
     # Opening: at least 3 archers whenever coins allow (3000 coins, all six rows threatened).
     assert sum(1 for k, *_ in triples(agent.get_reinforcements(CASES["all-rows-unknown"])) if k == 2) >= 3
-    # Wizard parked behind our x=6 shield: the penguin goes IN FRONT of the shield (x 7..9).
+    # Wizard parked in front of our x=6 shield: arm the trap, a penguin right BEHIND the shield (x=5).
     full = [u(t, x, y, h) for y in range(6) for t, x, h in (("defenceSolider", 1, 150), ("defenceShield", 6, 700))]
     wiz = pause([d for d in full if not (d["position"]["y"] == 0 and d["type"] == "defenceShield")]
                 + [u("defenceShield", 6, 0, 300, 700)], [foe("EnemyWizard", 10, 0, 500), foe("EnemClown", 10, 0, 200)])
     out = triples(agent.get_reinforcements(wiz))
-    assert any(k == 0 and y == 0 and 7 <= x <= 9 for k, x, y in out), out
+    assert (0, 5, 0) in out, out
     # End of wave: nothing queued, rows clearing in time -> spend nothing.
     calm = pause(full + [u("defenceArcher", 0, y, 100) for y in range(3)],
                  [foe("EnemClown", 9, 2, 120), foe("EnemyMonk", 7, 4, 100)], coins=3000, queued=0)
@@ -172,28 +172,31 @@ if __name__ == "__main__":
     out = triples(agent.get_reinforcements(short))
     assert any(k == 2 for k, *_ in out) and not any(k == 1 for k, *_ in out), out
 
-    # Exposed units get a shield only where enemies are coming (tank when needed, not on calm rows).
+    # A blocked row whose dps clears the enemy in time needs no shield (spare coins go to dps instead).
     exposed = pause([u("defenceArcher", 0, y, 100) for y in range(6)] + [u("defenceSolider", 1, 2, 150)],
                     [foe("EnemClown", 9, 2, 200)], coins=3000, queued=8)
     exposed["counts"]["totalEnemiesInWave"] = 12
     out = triples(agent.get_reinforcements(exposed))
-    assert {y for k, x, y in out if k == 3} == {2}, out
+    assert not any(k == 3 for k, *_ in out), out
 
-    # A shield was destroyed in row 4 (archer + soldier left) and an enemy is coming there -> shield again;
-    # with no enemy in row 4 it stays unshielded.
+    # Row 4 lost its shield (archer + soldier left). A lone clown that our dps kills in time: no shield...
     lost = pause([d for d in full if d["position"] != {"x": 6, "y": 4}] + [u("defenceArcher", 0, 4, 100)],
                  [foe("EnemClown", 9, 4, 200)], coins=2500, queued=6)
     lost["counts"]["totalEnemiesInWave"] = 12
-    assert any(k == 3 and y == 4 for k, _, y in triples(agent.get_reinforcements(lost)))
-    lost["enemies"] = [foe("EnemClown", 9, 1, 120)]
     assert not any(k == 3 and y == 4 for k, _, y in triples(agent.get_reinforcements(lost)))
+    # ...two wizards there while the archers are busy on row 0 and the coins are below the reserve: it falls
+    # -> a blocking shield (archers can't be afforded above the reserve).
+    lost["enemies"] = [foe("EnemyMonk", 3, 0, 280), foe("EnemyWizard", 8, 4, 500), foe("EnemyWizard", 10, 4, 500)]
+    lost["budget"]["remaining"] = 500
+    out = triples(agent.get_reinforcements(lost))
+    assert any(y == 4 and k in (0, 3) for k, _, y in out), out
 
-    # A single monk walking into an archer-only row: shield + soldier, NEVER a penguin.
+    # A single monk walking into an archer-only row with 6 archers on it: NEVER a penguin, and no shield.
     monk = pause([u("defenceArcher", 0, y, 100) for y in range(6)], [foe("EnemyMonk", 6, 2, 280)], coins=2500, queued=8)
     monk["counts"]["totalEnemiesInWave"] = 12
     out = triples(agent.get_reinforcements(monk))
     assert not any(k == 0 for k, *_ in out), out
-    assert any(k == 3 and y == 2 and x < 6 for k, x, y in out), out
+    assert not any(k == 3 and y == 2 for k, x, y in out), out  # 6 archers on that row kill it first: no shield
     # Same board, the LLM tries a penguin anyway: dropped.
     agent.USE_LLM, agent.LLMClient = True, FakeLLM
     FakeLLM.replies = [say({"placements": [[0, 5, 2]], "reason": "panic"})]
@@ -240,11 +243,29 @@ if __name__ == "__main__":
     spent = sum({0: 250, 1: 200, 2: 300, 3: 150}[k] for k, *_ in out)
     assert 2000 - spent >= agent.analyse(tc03)["reserve"], (spent, out)          # the reserve holds
     assert (3, 6, 5) in out and sum(1 for k, *_ in out if k == 2) >= 3, out       # densest row shielded first
-    # Density: 3 clowns bunched in a row that is holding -> a penguin right in front of the bunch.
+    # Density: 3 clowns bunched within 2 tiles (600 hp) -> penguin right in front of them, whatever the dps.
     bunch = pause([u("defenceArcher", 0, y, 100) for y in range(6)] + [u("defenceShield", 6, 4, 700)],
                   [foe("EnemClown", 9, 4, 200), foe("EnemClown", 9, 4, 200), foe("EnemClown", 10, 4, 200)], coins=2000, queued=6)
-    out = triples(agent.get_reinforcements(bunch))
-    assert (0, 8, 4) in out, out
+    assert (0, 8, 4) in triples(agent.get_reinforcements(bunch))
+    # A lone wizard the archers are killing: never a penguin (public TC03 lesson).
+    lone_w = pause([u("defenceArcher", 0, y, 100) for y in range(6)], [foe("EnemyWizard", 10, 3, 500)], coins=2000, queued=0)
+    assert not any(k == 0 for k, *_ in triples(agent.get_reinforcements(lone_w)))
+    # Two wizards our dps can't clear at a worn shield: the trap penguin behind it.
+    dense = pause([u("defenceArcher", 0, 0, 100), u("defenceShield", 6, 4, 200, 700)],
+                  [foe("EnemClown", 1, 0, 200)] + [foe("EnemyWizard", 9, 4, 500), foe("EnemyWizard", 10, 4, 500)], coins=2000, queued=6)
+    out = triples(agent.get_reinforcements(dense))
+    assert (0, 5, 4) in out, out  # trap: right behind the worn shield, fires when it falls
+    # Public TC04 pause 2: a wizard breaching row 1 (archer only), 700 coins -> the row-1 shield is paid first.
+    tc04p = pause([u("defenceArcher", 0, y, 100) for y in (0, 1, 3, 5)] + [u("defenceShield", 6, 4, 700), u("defenceShield", 6, 2, 700)],
+                  [foe("EnemyWizard", 5, 1, 462)], coins=700, queued=12)
+    tc04p["counts"]["totalEnemiesInWave"] = 15
+    tc04p["budget"]["unlocked"] = 2100 + 50 * 2
+    for llm in (False, True):
+        agent.USE_LLM, agent.LLMClient = llm, FakeLLM
+        FakeLLM.replies = [say({"option": "needed", "reason": "x"})]
+        out = triples(agent.get_reinforcements(tc04p))
+        assert out and out[0][0] == 3 and out[0][2] == 1, (llm, out)
+    agent.USE_LLM = False
     # ...but two spread-out clowns in a holding row: no penguin.
     spread = pause([u("defenceArcher", 0, y, 100) for y in range(6)] + [u("defenceShield", 6, 4, 700)],
                    [foe("EnemClown", 7, 4, 200), foe("EnemClown", 10, 4, 200)], coins=2000, queued=6)
@@ -263,6 +284,84 @@ if __name__ == "__main__":
     hold["budget"]["unlocked"] = 2100 + 50 * 6   # start 2100 -> reserve 600
     assert triples(agent.get_reinforcements(hold)) == [], agent.get_reinforcements(hold)
 
+    # DPS before shields: a top row with 1 archer losing to a clown. Spare coins above the reserve ->
+    # one more archer fixes it (model: t_clear 5.4 s < line 5.9 s), no shield...
+    top = pause([u("defenceArcher", 0, y, 100) for y in (0, 1, 2, 3, 4, 5)], [foe("EnemClown", 7, 5, 200)], coins=3000, queued=0)
+    top["defences"] = [d for d in top["defences"] if d["position"]["y"] == 5]
+    top["defences"] += [u("defenceShield", 6, y, 700) for y in range(5)]
+    out = triples(agent.get_reinforcements(top))
+    assert not any(k == 3 for k, *_ in out) and sum(1 for k, *_ in out if k == 2) >= 1, out
+    # ...no spare coins (below the reserve) and the clown already close (urgent): a blocking shield in row 5.
+    top["enemies"] = [foe("EnemClown", 5, 5, 200)]
+    top["budget"]["remaining"] = 400
+    top["budget"]["unlocked"] = 2000 + 50 * 9
+    out = triples(agent.get_reinforcements(top))
+    assert any(k == 3 and y == 5 for k, _, y in out), out
+    # Archer focus + queue: 4 archers clear a top-row clown easily when nothing is queued...
+    focus = pause([u("defenceArcher", 0, y, 100) for y in (0, 1, 2, 5)] + [u("defenceShield", 6, y, 700) for y in (3, 4)],
+                  [foe("EnemClown", 7, 5, 200)], coins=3000, queued=0)
+    assert agent.assess(agent.analyse(focus))["rows"][5]["status"] == "ok"
+    # ...but with 10 enemies still queued and spawning every 2 s, lower rows keep stealing the archers: row 5 falls.
+    focus["counts"].update(enemiesQueued=10, totalEnemiesInWave=15)
+    focus["elapsedSeconds"] = 10
+    r5 = agent.assess(agent.analyse(focus))["rows"][5]
+    assert r5["status"] == "critical" and r5["archer_share"] < 0.5, r5
+
+    # Public "12 wizards + 6 clowns, rows 2-3, 1400 coins" case.
+    wz = opening([{"enemyId": 2, "count": 12, "allowedRows": [2, 3]}, {"enemyId": 0, "count": 6, "allowedRows": [2, 3]}],
+                 coins=1400, first=("EnemyWizard", 10, 2, 500))
+    out = triples(agent.get_reinforcements(wz))
+    spent = sum({0: 250, 1: 200, 2: 300, 3: 150}[k] for k, *_ in out)
+    assert (3, 6, 2) in out and (3, 6, 3) in out, out                 # shields keep the beams off the archers
+    assert (0, 5, 2) in out and (0, 5, 3) in out, out                 # wizard-heavy rows: the trap penguins
+    assert 1400 - spent >= agent.analyse(wz)["reserve"], out
+    # Two wizards parked at a HEALTHY x=6 shield (~9 s of wall): not urgent -> no penguin yet, no 2nd shield.
+    base_wz = [u("defenceShield", 6, 2, 700), u("defenceShield", 6, 3, 700), u("defenceArcher", 0, 0, 100), u("defenceArcher", 0, 1, 100)]
+    park = pause(base_wz, [foe("EnemyWizard", 10, 2, 500), foe("EnemyWizard", 10, 2, 480)], coins=500, queued=14)
+    park["counts"]["totalEnemiesInWave"] = 18
+    park["budget"]["unlocked"] = 1400 + 50 * 2
+    out = triples(agent.get_reinforcements(park))
+    assert not any(k == 0 for k, *_ in out), out
+    assert not any(k == 3 and y == 2 for k, _, y in out), out
+    # Rows 1/4/5 are empty but coins are near the reserve: no fillers bought there.
+    assert not any(y in (1, 4, 5) for _, _, y in out), out
+    # A critical row whose shield is healthy, 100 coins: no second shield stacked behind it.
+    stack = pause(base_wz, [foe("EnemyWizard", 10, 3, 443)], coins=100, queued=13)
+    stack["counts"]["totalEnemiesInWave"] = 18
+    assert not any(k == 3 for k, *_ in triples(agent.get_reinforcements(stack)))
+
+    # Public "12 wizards" run 2, replayed. Pause 2: one wizard per row beaming a still-solid x=6 shield
+    # (~10 s of wall left): nothing urgent -> keep the coins (the run bought an archer here and went broke).
+    wz_defs = lambda h2, h3: [u("defenceShield", 6, 2, h2, 700), u("defenceShield", 6, 3, h3, 700),
+                              u("defenceArcher", 0, 0, 100), u("defenceArcher", 0, 1, 100)]
+    p2 = pause(wz_defs(510, 510), [foe("EnemyWizard", 10, 2, 481), foe("EnemyWizard", 10, 3, 372)], coins=500, queued=16)
+    p2["counts"]["totalEnemiesInWave"] = 18; p2["elapsedSeconds"] = 5.5; p2["budget"]["unlocked"] = 1400
+    assert triples(agent.get_reinforcements(p2)) == [], agent.get_reinforcements(p2)  # nothing urgent: keep the coins
+    # Pause 3: two healthy wizards parked in row 2 -> the trap penguin behind the shield, even near the reserve.
+    p3 = pause(wz_defs(300, 260), [foe("EnemyWizard", 10, 2, 480), foe("EnemyWizard", 10, 2, 469), foe("EnemyWizard", 10, 3, 450)],
+               coins=550, queued=14)
+    p3["counts"]["totalEnemiesInWave"] = 18; p3["elapsedSeconds"] = 10.7; p3["budget"]["unlocked"] = 1450
+    out = triples(agent.get_reinforcements(p3))
+    assert (0, 5, 2) in out, out
+    # Pause 4: row 3's shield is about to fall (20 hp) under a wizard -> it gets replaced now.
+    p4 = pause(wz_defs(500, 20) + [u("defenceArcher", 0, 2, 100)], [foe("EnemyWizard", 10, 3, 369)], coins=300, queued=13)
+    p4["counts"]["totalEnemiesInWave"] = 18; p4["elapsedSeconds"] = 16; p4["budget"]["unlocked"] = 1600
+    out = triples(agent.get_reinforcements(p4))
+    assert any(y == 3 and k in (0, 2, 3) for k, _, y in out), out
+
+    # TC11: an armed trap whose shield is about to fall is left alone (no shield stacked over the penguin).
+    armed = pause([u("defenceShield", 6, 3, 60, 700), u("defenceShield", 6, 2, 700), u("defencePenguin", 5, 3, 200),
+                   u("defencePenguin", 5, 2, 200), u("defenceArcher", 0, 0, 100)],
+                  [foe("EnemyWizard", 10, 3, 500), foe("EnemyWizard", 10, 3, 500), foe("EnemClown", 9, 3, 200)], coins=400, queued=10)
+    armed["counts"]["totalEnemiesInWave"] = 18
+    assert not any(y == 3 for _, _, y in triples(agent.get_reinforcements(armed)))
+    # ...and after it fired (row empty, a new wizard there): rebuild the trap.
+    fired = pause([u("defenceShield", 6, 2, 700), u("defencePenguin", 5, 2, 200), u("defenceArcher", 0, 0, 100)],
+                  [foe("EnemyWizard", 10, 3, 500), foe("EnemyWizard", 10, 3, 480)], coins=500, queued=8)
+    fired["counts"]["totalEnemiesInWave"] = 18
+    out = triples(agent.get_reinforcements(fired))
+    assert any(k == 0 and y == 3 for k, _, y in out) and any(k == 3 and y == 3 for k, _, y in out), out
+
     # --- LLM path, with a fake client ---------------------------------------
     agent.USE_LLM, agent.LLMClient = True, FakeLLM
     FakeLLM.replies = [say({"option": "lean", "reason": "test"})]
@@ -274,7 +373,7 @@ if __name__ == "__main__":
     out = triples(agent.get_reinforcements(TC01_STALL))
     assert out[-2:] == [(0, 3, 3), (2, 0, 3)] and len({y for *_, y in out}) == 6, out  # fillers for empty rows first
     FakeLLM.replies = [say({"option": "hold", "reason": "save coins"})]
-    assert {y for k, x, y in triples(agent.get_reinforcements(exposed)) if k == 3} == {2}
+    assert not any(k == 3 for k, *_ in triples(agent.get_reinforcements(exposed)))
     # Public TC02 pause 5: wizard breaching row 3, 150 coins, the LLM spends them on row 1 -> row 3 still gets its shield.
     tc02b = pause([u("defenceArcher", 0, 2, 100), u("defenceSolider", 1, 2, 150), u("defenceShield", 6, 0, 700),
                    u("defenceShield", 6, 4, 400, 700), u("defenceShield", 6, 5, 700), u("defenceSolider", 1, 4, 150)],
